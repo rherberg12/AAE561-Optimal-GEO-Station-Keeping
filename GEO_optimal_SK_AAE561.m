@@ -8,7 +8,7 @@ clc; clear; close all;
 
 %% Parameters
 global nE a_GEO V_GEO J2 muE RE muS muM AU emiss area mass JD0...
-    alpha0 t0 f1 f2 f3 f4 N
+    alpha0 t0 f1 f2 N
 
 AU = 1.496E8; %km
 J2 = 1.082635E-3;
@@ -33,7 +33,7 @@ JD0 = juliandate(year,month,day);
 % Discretization for Optimal Control
 t0 = 0; % s
 tf = 86400; % s (one day)
-h_c = 10000; % s
+h_c = 500; % s
 tspan_c = 0:h_c:tf;
 N = length(tspan_c);
 
@@ -80,9 +80,9 @@ for i = 1:N-1
     end
 end
 
-epsilonLB = -6E-2;
-epsilonUB = 6E-2;
-Xlb_set = [-100;-3E-4;-3E-4;-2.5E-4;-2.5E-4;epsilonLB];
+epsilonLB = -6E-4;
+epsilonUB = 6E-4;
+Xlb_set = [-100;-3E-2;-3E-2;-2.5E-2;-2.5E-2;epsilonLB];
 Xub_set = -1.*Xlb_set;
 Xlb = zeros(6*(N-1),1);
 Xub = zeros(6*(N-1),1);
@@ -90,26 +90,28 @@ for i = 1:N-1
     Xlb(6*i-5:6*i,1) = Xlb_set;
     Xub(6*i-5:6*i,1) = Xub_set;
 end
-Umin = 0; % N
-Umax = 0.05; % N
+Umin = 0*10^-3;%0.5/h_c; % mN
+Umax = 0.05*10^-3; % mN
 
 x0 = zeros(6,1);
 
 % Optimization Constraint Functions:
 f1 = @(U) -F*x0 - H*U - J*D + Xlb;
 f2 = @(U) F*x0 + H*U + J*D - Xub;
-f3 = @(U) -norm(U) + Umin;
-f4 = @(U) norm(U) - Umax;
 
 % Subgradient method parameters
-R = 0.001; % Step size parameter
-max_iter = 500; % Maximum number of iterations
-tol = 1e-6; % Convergence tolerance
+Rglobal = 0.001; % Step size parameter
+max_iter = 50000; % Maximum number of iterations
+tol = 1e-9; % Convergence tolerance
 u0 = zeros(3*(N-1),1); % initial point
 u_k = zeros(3*(N-1),1); % Initialize uk
-step = @(k) R / sqrt(k + 0.5);
+%step = @(k,R) R*(1-(k/(2*max_iter)));
+step = @(f) f*0.1;
 
 % Iteration
+iter = 0;
+c_index_old = 0;
+step_increase_iter = max_iter*0.01;
 for k = 1: max_iter
     % Compute function values
     f_val = fcn_nonsmooth_obj(u_k); % objective function values
@@ -139,67 +141,83 @@ for k = 1: max_iter
     % Compute f_bar(x_k) and g_bar(x_k)
     f_bar = max(c); % Maximum of constraints
     
-    check = 0;
-    cnstr_flg = 0;
     for i = 1:length(c)
-        if abs(f_bar - c(i)) < tolerance
-            check = check + 1;
-        end
-    end
-    
-    if check > 1
-        % Priority based tie breaker: choose f1 if more than one are equal
-        g_bar = 1*ones(3*(N-1),1); % Gradient of f4(U) = U - Umax <= 0
-    else
-        for i = 1:length(c)
-            if i < (N-1)*6 + 1 % f1(U) = -Fx0 - HU - JD + Xlb <= 0
-                if abs(f_bar - c(i)) < tolerance % f1(U) = -Fx0 - HU - JD + Xlb <= 0
-                    g_bar = -H*ones(3*(N-1),1); % Gradient of violated constraint
-                    cnstr_flg = 1;
-                    c_index = i;
-                end
-            elseif i < 2*(N-1)*6 + 1 % f2(U) = Fx0 + HU + JD - Xub <= 0
-                if abs(f_bar - c(i)) < tolerance
-                    g_bar = H*ones(3*(N-1),1); % Gradient of violated constraint
-                    cnstr_flg = 1;
-                    c_index = i;
-                end
-            elseif i < 2*(N-1)*6 + 2
-                if abs(f_bar - c(i)) < tolerance
-                    g_bar = -1*ones(3*(N-1),1); % Gradient of f3(U) = -U + Umin <= 0
-                    c_index = i;
-                end
-            elseif i == 2*(N-1)*6 + 2
-                if abs(f_bar - c(i)) < tolerance
-                    g_bar = 1*ones(3*(N-1),1); % Gradient of f4(U) = U - Umax <= 0
-                    c_index = i;
-                end
-            else        
-                error('Unexpected case: f_bar does not match any constraint');
+        if i < (N-1)*6 + 1 % f1(U) = -Fx0 - HU - JD + Xlb <= 0
+            if abs(f_bar - c(i)) < tolerance % f1(U) = -Fx0 - HU - JD + Xlb <= 0
+                g_bar = -H*ones(3*(N-1),1); % Gradient of violated constraint
+                c_index = i;
+                driving_constraint = c_index;
             end
+        elseif i < 2*(N-1)*6 + 1 % f2(U) = Fx0 + HU + JD - Xub <= 0
+            if abs(f_bar - c(i)) < tolerance
+                g_bar = H*ones(3*(N-1),1); % Gradient of violated constraint
+                c_index = i - (6*(N-1));
+                driving_constraint = i;
+            end
+        else
+            error('Unexpected case: f_bar does not match any constraint');
         end
     end
     
+    constr_flg = 0;
     % Determine p_k
-    if f_bar < norm(g_bar(c_index)) * step(k)
-        p_k = grad_f; % Use gradient of objective
+    if f_bar < 0 % There is no natural improvement without thrust....
+        if norm(u_k) == 0
+            p_k = 0;
+        else
+            p_k = grad_f; % Use gradient of objective
+        end
+        constr_flg = 1;
     else
         p_k = g_bar;
     end
     
-    % Update rule with projection
-    u_update = u_k;
-    u_update(c_index) = u_k(c_index) - step(k) * p_k(c_index) / norm(p_k(c_index));
-    u_next = project_with_fmincon_nonsmooth(u_update);
+    % Define step size
+    if c_index_old ~= driving_constraint
+        Rlocal = Rglobal;
+        search = 1; % Restart search iteration criteria
+    elseif search < max_iter
+        if search > step_increase_iter
+            Rlocal = 2*Rlocal;
+        end
+        search = search+1;
+    else
+        fprintf('Max iterations exceeded');
+        break;
+    end
+    
+    % Update
+    if constr_flg == 0
+        x_step = zeros(6*(N-1),1);
+        x_step(c_index) = step(f_bar)*p_k(c_index)/norm(p_k(c_index));
+        u_step = H\x_step;
+        u_update = u_k + u_step;
+    else
+        u_update = u_k - step(f_bar) * p_k;
+    end
+    
+    % project each propulsive maneuver to the feasible set
+    u_next = project_with_fmincon_nonsmooth(u_update,Umin,Umax);
     
     % Check for convergence
-    if norm(u_next - u_k) < tol
+    conv = 0;
+    for i = 1:length(u_k)
+        if norm(u_next(i) - u_k(i)) > tol
+            conv = 1;
+        end
+    end
+    if conv ~= 1
         fprintf('Converged at iteration %d\n', k);
         break;
     end
     
     % update x_k
-    u_k = u_next;    
+    u_k = u_next;
+    
+    % Search variables
+    iter = iter+1;
+    c_index_old = driving_constraint;
+    disp(f_bar)
 end
 
 u_opt_sub = u_k;
@@ -210,8 +228,8 @@ f_opt_sub = fcn_nonsmooth_obj(u_k);
 
 % Discretization for Propogation
 t0 = 0; % s
-tf = 86400; % s (one day)
-h_p = 500; % s
+num_points = 1000;
+h_p = tf/num_points; % s
 tspan_p = 0:h_p:tf;
 
 X_SC = zeros(6,length(tspan_p)); % GEO Slot Center
@@ -276,68 +294,87 @@ end
 %% Output
 
 % Display Propogation of Sat and SC:
+ax = 14;
+ti = 18;
+Ti = 20;
 
 %Plot of propogated motion about slot center
 figure(1)
 plot(X(2,:),X(3,:));
-xlabel('E3');
-ylabel('E2');
-title('Relative Eccentricity Vector');
+xlabel('E3','fontsize', ax);
+ylabel('E2','fontsize', ax);
+title('Relative Eccentricity Vector', 'fontsize', ti);
 grid on
 
 figure(2)
 plot(X(4,:),X(5,:));
-xlabel('E5');
-ylabel('E4');
-title('Relative Inclination Vector');
+xlabel('E5','fontsize', ax);
+ylabel('E4','fontsize', ax);
+title('Relative Inclination Vector','fontsize', ti);
 grid on
 
 figure(3)
-tiledlayout(3,1)
-title('Relative Position to GEO Slot Center (ECI Frame)');
+fig3 = tiledlayout(3,1);
+title(fig3, 'Relative Position to GEO Slot Center (ECI Frame)','fontsize', Ti);
 nexttile
-plot(tspan_p/86400,X_SC(1,:)-X_SAT(1,:));
-ylabel('$X_{SC} - X_{SAT}$','Interpreter','Latex');
+plot(tspan_p/86400,X_SC(1,:)-X_SAT(1,:), 'Color', 'black');
+ylabel('$X_{SC} - X_{SAT}$ [km]','Interpreter','Latex','fontsize',ax);
+xlabel('Time [days]','fontsize', ax);
+title('X Relative Position','fontsize', ti);
+grid on
 
 nexttile
-plot(tspan_p/86400,X_SC(2,:)-X_SAT(2,:));
-ylabel('$Y_{SC} - Y_{SAT}$','Interpreter','Latex');
+plot(tspan_p/86400,X_SC(2,:)-X_SAT(2,:), 'Color', 'black');
+ylabel('$Y_{SC} - Y_{SAT}$ [km]','Interpreter','Latex','fontsize', ax);
+xlabel('Time [days]','fontsize', ax);
+title('Y Relative Position','fontsize', ti);
+grid on
 
 nexttile
-plot(tspan_p/86400,X_SC(3,:)-X_SAT(3,:));
-xlabel('Time [days]');
-ylabel('$Z_{SC} - Z_{SAT}$','Interpreter','Latex');
+plot(tspan_p/86400,X_SC(3,:)-X_SAT(3,:), 'Color', 'black');
+ylabel('$Z_{SC} - Z_{SAT}$ [km]','Interpreter','Latex');
+xlabel('Time [days]','fontsize', ax);
+title('Z Relative Position','fontsize', ti);
+grid on
 
 figure(4)
-tiledlayout(3,1)
-title('Positions Over Time (ECI Frame)');
+fig4 = tiledlayout(3,1);
+title(fig4, 'Positions Over Time (ECI Frame)','fontsize', ti);
 nexttile
-plot(tspan_p/86400,X_SC(1,:));
+plot(tspan_p/86400,X_SAT_nom(1,:)-X_SC(1,:));
 hold on
-plot(tspan_p/86400,X_SAT_nom(1,:));
-plot(tspan_p/86400,X_SAT(1,:));
-legend('$X_{SC}$','$X_{free}$','$X_{c}$', 'Interpreter', 'Latex');
-ylabel('X');
+grid on
+plot(tspan_p/86400,X_SAT(1,:)-X_SC(1,:));
+legend('$X_{free}$','$X_{c}$', 'Interpreter', 'Latex','fontsize', 11);
+xlabel('Time [days]','fontsize', ax);
+ylabel('X [km]','fontsize', ax);
 nexttile
-plot(tspan_p/86400,X_SC(2,:));
+plot(tspan_p/86400,X_SAT_nom(2,:)-X_SC(2,:));
 hold on
-plot(tspan_p/86400,X_SAT_nom(2,:));
-plot(tspan_p/86400,X_SAT(2,:));
-legend('$Y_{SC}$','$Y_{free}$','$Y_{c}$', 'Interpreter', 'Latex');
-ylabel('Y');
+grid on
+plot(tspan_p/86400,X_SAT(2,:)-X_SC(2,:));
+legend('$Y_{free}$','$Y_{c}$', 'Interpreter', 'Latex');
+xlabel('Time [days]','fontsize', ax);
+ylabel('Y [km]','fontsize', ax);
 nexttile
-plot(tspan_p/86400,X_SC(3,:));
+plot(tspan_p/86400,X_SAT_nom(3,:)-X_SC(3,:));
 hold on
-plot(tspan_p/86400,X_SAT_nom(3,:));
-plot(tspan_p/86400,X_SAT(3,:));
-legend('$Z_{SC}$','$Z_{free}$','$Z_{c}$', 'Interpreter', 'Latex');
-ylabel('Z');
-xlabel('Time [days]');
+grid on
+plot(tspan_p/86400,X_SAT(3,:)-X_SC(3,:));
+legend('$Z_{free}$','$Z_{c}$', 'Interpreter', 'Latex');
+ylabel('Z [km]','fontsize', ax);
+xlabel('Time [days]','fontsize', ax);
 
 % Display constraints and optimal solution
 control_positions = -F*x0 - H*u_opt_sub - J*D;
 thrust_magnitude = zeros(length(N),1);
 thrust_magnitude(1) = norm(u0);
+thrustX = zeros(length(N),1);
+thrustX(1) = norm(u0(1));
+thrustY = zeros(length(N),1);
+thrustY(1) = norm(u0(2));
+thrustZ = zeros(length(N),1);
+thrustZ(1) = norm(u0(3));
 E = zeros(6,length(N));
 E(:,1) = x0;
 Xlower = zeros(6,length(N));
@@ -346,20 +383,23 @@ Xupper = zeros(6,length(N));
 Xupper(:,1) = Xub_set;
 for i = 1:N-1
     thrust_magnitude(i+1) = norm(u_opt_sub(3*i-2:3*i,1));
+    thrustX(i+1) = u_opt_sub(3*i-2,1);
+    thrustY(i+1) = u_opt_sub(3*i-1,1);
+    thrustZ(i+1) = u_opt_sub(3*i,1);
     E(:,i+1) = control_positions(6*i-5:6*i);
     Xlower(:,i+1) = Xlb(6*i-5:6*i);
     Xupper(:,i+1) = Xub(6*i-5:6*i);
 end
 
 figure(5)
-tiledlayout(6,1)
-title('Resultant Equinoctial Orbital Elements wrt Constraints');
+fig5 = tiledlayout(3,1);
+title(fig5,'Resultant Equinoctial Orbital Elements wrt Constraints','fontsize', Ti);
 nexttile
 plot(tspan_c/86400,E(1,:), 'linewidth', 3, 'Color', 'red');
 hold on
 plot(tspan_c/86400,Xlower(1,:), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
 plot(tspan_c/86400,Xupper(1,:), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
-ylabel('E1');
+ylabel('E1','fontsize', ax);
 grid on
 
 nexttile
@@ -367,7 +407,7 @@ plot(tspan_c/86400,E(2,:), 'linewidth', 3, 'Color', 'green');
 hold on
 plot(tspan_c/86400,Xlower(2,:), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
 plot(tspan_c/86400,Xupper(2,:), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
-ylabel('E2');
+ylabel('E2','fontsize', ax);
 grid on
 
 nexttile
@@ -375,15 +415,19 @@ plot(tspan_c/86400,E(3,:), 'linewidth', 3, 'Color', 'blue');
 hold on
 plot(tspan_c/86400,Xlower(3,:), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
 plot(tspan_c/86400,Xupper(3,:), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
-ylabel('E3');
+ylabel('E3','fontsize', ax);
+xlabel('Time [days]','fontsize', ax);
 grid on
 
+figure(6)
+fig6 = tiledlayout(3,1);
+title(fig6,'Resultant Equinoctial Orbital Elements wrt Constraints','fontsize', Ti);
 nexttile
 plot(tspan_c/86400,E(4,:), 'linewidth', 3, 'Color', 'yellow');
 hold on
 plot(tspan_c/86400,Xlower(4,:), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
 plot(tspan_c/86400,Xupper(4,:), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
-ylabel('E4');
+ylabel('E4','fontsize', ax);
 grid on
 
 nexttile
@@ -391,7 +435,7 @@ plot(tspan_c/86400,E(5,:), 'linewidth', 3, 'Color', 'magenta');
 hold on
 plot(tspan_c/86400,Xlower(5,:), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
 plot(tspan_c/86400,Xupper(5,:), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
-ylabel('E5');
+ylabel('E5','fontsize', ax);
 grid on
 
 nexttile
@@ -399,20 +443,38 @@ plot(tspan_c/86400,E(6,:), 'linewidth', 3, 'Color', 'cyan');
 hold on
 plot(tspan_c/86400,Xlower(6,:), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
 plot(tspan_c/86400,Xupper(6,:), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
-ylabel('E6');
+ylabel('E6','fontsize', ax);
 grid on
-xlabel('Time [days]');
+xlabel('Time [days]','fontsize', ax);
 
-figure(6)
-stairs(tspan_c/86400, thrust_magnitude, 'linewidth', 3, 'Color', 'green');
+figure(7)
+stairs(tspan_c/86400, thrust_magnitude*1000, 'linewidth', 3, 'Color', 'green');
 hold on
-plot(tspan_c/86400, Umin*ones(length(tspan_c)), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
-plot(tspan_c/86400, Umax*ones(length(tspan_c)), 'linewidth', 3, 'Linestyle', '--', 'Color', 'black');
-xlabel('Time [days]');
-ylabel('Thrust Magnitude');
-title('Thrust Magnitude wrt Constraints');
+xlabel('Time [days]','fontsize', ax);
+ylabel('|U| [mN]','fontsize', ax);
+title('Thrust Magnitude','fontsize', ti);
 grid on
 
+
+figure(8)
+fig8 = tiledlayout(3,1);
+title(fig8, 'Directional Thrust Values (RTN Frame)','fontsize', Ti);
+nexttile
+stairs(tspan_c/86400,thrustX*1000);
+hold on
+grid on
+ylabel('$U_X$ [mN]','Interpreter','Latex','fontsize', ax);
+nexttile
+stairs(tspan_c/86400,thrustY*1000);
+hold on
+grid on
+ylabel('$U_Y$ [mN]','Interpreter','Latex','fontsize', ax);
+nexttile
+stairs(tspan_c/86400,thrustZ*1000);
+hold on
+grid on
+ylabel('$U_Z [mN]$','Interpreter','Latex','fontsize', ax);
+xlabel('Time [days]','fontsize', ax);
 
 %% Local Functions:
 
@@ -427,10 +489,10 @@ function [c, ceq] = fcn_nonsmooth_cons(u)
     % Constraints:
     % f1(U) = -Fx0 - HU - JD + Xlb <= 0
     % f2(U) = Fx0 + HU + JD - Xub <= 0
-    % f3(U) = -U + Umin <= 0
-    % f4(U) = U - Umax <= 0
-    global f1 f2 f3 f4
-    c = [f1(u); f2(u); f3(u); f4(u)];
+    % f3(U) = -U + Umin <= 0 *Applied in projection function below
+    % f4(U) = U - Umax <= 0 *Applied in projection function below
+    global f1 f2
+    c = [f1(u); f2(u)];
     ceq = [];
 end
 
@@ -440,7 +502,7 @@ function g = nonsmooth_obj_subgradient(u)
     g = ones(3*(N-1),1);
 end
 
-function u_proj = project_with_fmincon_nonsmooth(u_update, Umax, Umin)
+function u_proj = project_with_fmincon_nonsmooth(u_update, Umin, Umax)
     % use fmincon to project u_update onto the feasible set Q
     options = optimoptions('fmincon', 'Display', 'none', 'Algorithm', 'sqp');
     
@@ -448,13 +510,25 @@ function u_proj = project_with_fmincon_nonsmooth(u_update, Umax, Umin)
     objective = @(u) norm(u - u_update);
     
     % Define maximum and minimum constraint in A and b
-    A = [u_update(1)/norm(u_update(1)),u_update(2)/norm(u_update(2)),u_update(3)/norm(u_update(3));
-        u_update(1)/norm(u_update(1)),u_update(2)/norm(u_update(2)),u_update(3)/norm(u_update(3))];
-    b = [Umax;-Umin];
+    % f3(U) = -U + Umin <= 0
+    % f4(U) = U - Umax <= 0
+    A = zeros(length(u_update),length(u_update));
+    b = zeros(length(u_update),1);
+    Aeq = zeros(length(u_update),length(u_update));
+    beq = zeros(length(u_update),1);
     
+    for i = 1:length(u_update)
+        if norm(u_update(i)) > Umin
+            A(i,i) = u_update(i)/norm(u_update(i));
+            b(i) = Umax;
+        elseif norm(u_update(i)) > 0
+            Aeq(i,i) = 1;
+            beq(i) = sign(u_update(i))*Umin;
+        end
+    end
     
     % Solve the projection problem with fmincon
-    u_proj = fmincon(objective, u_update, A, b, [], [], [], [], [], options);
+    u_proj = fmincon(objective, u_update, A, b, Aeq, beq, [], [], [], options);
 end
 
 % Runge Kutta Propogator
